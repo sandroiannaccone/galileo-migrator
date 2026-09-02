@@ -1,0 +1,8 @@
+*.xml
+*.db
+*.sqlite
+*.sqlite3
+
+# Ignora l'ambiente virtuale Python
+venv/
+__pycache__/
