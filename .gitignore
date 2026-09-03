@@ -2,6 +2,7 @@
 *.db
 *.sqlite
 *.sqlite3
+.env
 
 # Ignora l'ambiente virtuale Python
 venv/

@@ -25,6 +25,7 @@ CATEGORY_SELECT_OPTIONS = [""] + TARGET_CATEGORIES
 RICERCA_ITALIA_CAT = "Ricerca d'Italia"
 ORFANI_RICERCA_ITALIA = "Orfani Ricerca d'Italia"
 EXTRA_CAT = "Extra"
+FALLBACK_AUTHOR = "Redazione di Galileo"
 
 CREATE_CATEGORY_MAP_SQL = """
 CREATE TABLE IF NOT EXISTS category_map (
@@ -422,17 +423,117 @@ def get_mapping_stats(conn: sqlite3.Connection) -> tuple[int, int, int]:
     total = conn.execute(
         "SELECT COUNT(*) FROM articles WHERE is_deleted = 0"
     ).fetchone()[0]
-    mapped = conn.execute("SELECT COUNT(*) FROM article_overrides").fetchone()[0]
-    to_map = conn.execute(
+    mapped, to_map = get_prominent_mapping_counts(conn)
+    return total, mapped, to_map
+
+
+def get_prominent_mapping_counts(conn: sqlite3.Connection) -> tuple[int, int]:
+    """Contatori principali: categorizzati vs restanti da mappare manualmente."""
+    conteggio_mappati = conn.execute(
+        "SELECT COUNT(*) FROM article_overrides WHERE is_deleted = 0"
+    ).fetchone()[0]
+    conteggio_da_mappare = conn.execute(
         """
         SELECT COUNT(*)
-        FROM articles a
-        LEFT JOIN article_overrides ao ON a.wp_id = ao.wp_id
-        WHERE a.is_deleted = 0
-          AND ao.wp_id IS NULL
+        FROM articles
+        WHERE is_deleted = 0
+          AND wp_id NOT IN (SELECT wp_id FROM article_overrides)
         """
     ).fetchone()[0]
-    return total, mapped, to_map
+    return conteggio_mappati, conteggio_da_mappare
+
+
+def render_prominent_mapping_metrics(conn: sqlite3.Connection) -> None:
+    """Metriche principali in evidenza sotto il titolo della pagina."""
+    conteggio_mappati, conteggio_da_mappare = get_prominent_mapping_counts(conn)
+
+    prev_mappati = st.session_state.get("prev_conteggio_mappati")
+    prev_da_mappare = st.session_state.get("prev_conteggio_da_mappare")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric(
+            label="✅ Articoli Categorizzati",
+            value=conteggio_mappati,
+            delta=None if prev_mappati is None else conteggio_mappati - prev_mappati,
+        )
+    with col2:
+        st.metric(
+            label="⏳ Da Mappare (Manuali)",
+            value=conteggio_da_mappare,
+            delta=None
+            if prev_da_mappare is None
+            else conteggio_da_mappare - prev_da_mappare,
+            delta_color="inverse",
+        )
+
+    st.session_state["prev_conteggio_mappati"] = conteggio_mappati
+    st.session_state["prev_conteggio_da_mappare"] = conteggio_da_mappare
+
+
+def get_last_mapped_article(conn: sqlite3.Connection) -> tuple[str, str] | None:
+    """Restituisce titolo e categoria dell'ultimo override inserito."""
+    row = conn.execute(
+        """
+        SELECT a.title, o.target_category
+        FROM article_overrides o
+        JOIN articles a ON o.wp_id = a.wp_id
+        ORDER BY o.ROWID DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    if not row:
+        return None
+    return row[0] or "Senza titolo", row[1] or "—"
+
+
+def render_last_mapped_feed(conn: sqlite3.Connection) -> None:
+    """Feed live con l'ultimo articolo categorizzato."""
+    last_mapped = get_last_mapped_article(conn)
+    if not last_mapped:
+        return
+
+    titolo, categoria = last_mapped
+    st.success(
+        f"⚡ **Ultimo articolo mappato:** *{titolo}* ➡️ **{categoria}**"
+    )
+
+
+def get_mapping_category_stats_df(conn: sqlite3.Connection) -> pd.DataFrame:
+    """Distribuzione degli articoli per categoria target (solo override attivi)."""
+    return pd.read_sql_query(
+        """
+        SELECT target_category, COUNT(*) AS conteggio
+        FROM article_overrides
+        WHERE is_deleted = 0
+        GROUP BY target_category
+        ORDER BY conteggio DESC
+        """,
+        conn,
+    )
+
+
+def render_mapping_statistics(conn: sqlite3.Connection) -> None:
+    """Mostra la distribuzione delle categorie assegnate."""
+    stats_df = get_mapping_category_stats_df(conn)
+    if stats_df.empty:
+        st.caption("Nessun articolo categorizzato ancora.")
+        return
+
+    chart_df = stats_df.set_index("target_category")
+    st.bar_chart(chart_df, height=280)
+
+    with st.expander("Dettaglio numerico"):
+        st.dataframe(
+            stats_df.rename(
+                columns={
+                    "target_category": "Categoria",
+                    "conteggio": "Conteggio",
+                }
+            ),
+            hide_index=True,
+            width="stretch",
+        )
 
 
 def get_mapped_articles_df(conn: sqlite3.Connection) -> pd.DataFrame:
@@ -481,11 +582,11 @@ def search_articles(conn: sqlite3.Connection, query: str) -> list[dict]:
             """
             SELECT wp_id, title, slug, excerpt, categories, is_ricerca_italia
             FROM articles
-            WHERE is_deleted = 0 AND title LIKE ?
+            WHERE is_deleted = 0 AND (title LIKE ? OR author LIKE ?)
             ORDER BY title
             LIMIT 20
             """,
-            (f"%{query}%",),
+            (f"%{query}%", f"%{query}%"),
         ).fetchall()
 
     return [
@@ -521,16 +622,19 @@ def update_article(
     conn.commit()
 
 
-def extract_unique_authors(conn: sqlite3.Connection) -> list[str]:
+def extract_unique_authors(conn: sqlite3.Connection) -> list[tuple[str, int]]:
     rows = conn.execute(
         """
-        SELECT DISTINCT author FROM articles
+        SELECT author, COUNT(*) AS conteggio
+        FROM articles
         WHERE is_deleted = 0
           AND author IS NOT NULL
           AND author != ''
+        GROUP BY author
+        ORDER BY conteggio DESC
         """
     ).fetchall()
-    return sorted(row[0] for row in rows)
+    return [(row[0], row[1]) for row in rows]
 
 
 def save_category_map(
@@ -575,15 +679,23 @@ def save_category_map(
     return mapped, overrides_created, deleted
 
 
-def save_author_map(conn: sqlite3.Connection, df: pd.DataFrame) -> int:
+def save_author_map(
+    conn: sqlite3.Connection, df: pd.DataFrame, apply_fallback: bool = False
+) -> int:
     saved = 0
     for _, row in df.iterrows():
         new_author = row.get("Nuovo Autore", "")
         if pd.isna(new_author) or not str(new_author).strip():
-            continue
+            if apply_fallback:
+                new_author = FALLBACK_AUTHOR
+            else:
+                continue
+        else:
+            new_author = str(new_author).strip()
+
         conn.execute(
             "INSERT OR REPLACE INTO author_map (old_author, new_author) VALUES (?, ?)",
-            (row["Vecchio Autore"], str(new_author).strip()),
+            (row["Vecchio Autore"], new_author),
         )
         saved += 1
     conn.commit()
@@ -755,69 +867,68 @@ def render_category_mapping(conn: sqlite3.Connection) -> None:
     old_categories = df["Vecchia Categoria"].tolist()
     if not old_categories:
         st.info("Nessuna categoria trovata negli articoli.")
-        return
-
-    selected_cat = st.selectbox(
-        "Seleziona una vecchia categoria da ispezionare",
-        options=old_categories,
-    )
-
-    if selected_cat:
-        if msg := st.session_state.pop("override_save_msg", None):
-            st.success(msg)
-
-        hide_mapped = st.checkbox("Nascondi articoli già mappati", value=True)
-        articles_df = get_articles_for_category(
-            conn, selected_cat, hide_mapped=hide_mapped
-        )
-        st.caption(
-            f"{len(articles_df)} articoli contengono la categoria «{selected_cat}»"
-            + (" (inbox: solo da mappare)" if hide_mapped else "")
+    else:
+        selected_cat = st.selectbox(
+            "Seleziona una vecchia categoria da ispezionare",
+            options=old_categories,
         )
 
-        edited_articles = st.data_editor(
-            articles_df,
-            column_config={
-                "wp_id": st.column_config.NumberColumn(
-                    "wp_id", disabled=True, format="%d"
-                ),
-                "Titolo": None,
-                **get_article_link_column_config(),
-                "Data": st.column_config.TextColumn("Data", disabled=True),
-                "Categorie Originali": st.column_config.TextColumn(
-                    "Categorie Originali", disabled=True
-                ),
-                "Assegnazione Singola": st.column_config.SelectboxColumn(
-                    "Assegnazione Singola",
-                    options=CATEGORY_SELECT_OPTIONS,
-                    required=False,
-                ),
-            },
-            column_order=(
-                "wp_id",
-                "url",
-                "Data",
-                "Categorie Originali",
-                "Assegnazione Singola",
-            ),
-            hide_index=True,
-            width="stretch",
-            key=f"article_override_{selected_cat}_{hide_mapped}",
-        )
+        if selected_cat:
+            if msg := st.session_state.pop("override_save_msg", None):
+                st.success(msg)
 
-        if st.button("Salva Assegnazioni Singole", type="primary"):
-            saved, deleted = save_article_overrides(conn, edited_articles)
-            parts = []
-            if saved:
-                parts.append(f"{saved} override in article_overrides")
-            if deleted:
-                parts.append(f"{deleted} articoli cestinati")
-            st.session_state["override_save_msg"] = (
-                "Salvataggio completato: " + ", ".join(parts) + "."
-                if parts
-                else "Nessuna modifica da salvare."
+            hide_mapped = st.checkbox("Nascondi articoli già mappati", value=True)
+            articles_df = get_articles_for_category(
+                conn, selected_cat, hide_mapped=hide_mapped
             )
-            st.rerun()
+            st.caption(
+                f"{len(articles_df)} articoli contengono la categoria «{selected_cat}»"
+                + (" (inbox: solo da mappare)" if hide_mapped else "")
+            )
+
+            edited_articles = st.data_editor(
+                articles_df,
+                column_config={
+                    "wp_id": st.column_config.NumberColumn(
+                        "wp_id", disabled=True, format="%d"
+                    ),
+                    "Titolo": None,
+                    **get_article_link_column_config(),
+                    "Data": st.column_config.TextColumn("Data", disabled=True),
+                    "Categorie Originali": st.column_config.TextColumn(
+                        "Categorie Originali", disabled=True
+                    ),
+                    "Assegnazione Singola": st.column_config.SelectboxColumn(
+                        "Assegnazione Singola",
+                        options=CATEGORY_SELECT_OPTIONS,
+                        required=False,
+                    ),
+                },
+                column_order=(
+                    "wp_id",
+                    "url",
+                    "Data",
+                    "Categorie Originali",
+                    "Assegnazione Singola",
+                ),
+                hide_index=True,
+                width="stretch",
+                key=f"article_override_{selected_cat}_{hide_mapped}",
+            )
+
+            if st.button("Salva Assegnazioni Singole", type="primary"):
+                saved, deleted = save_article_overrides(conn, edited_articles)
+                parts = []
+                if saved:
+                    parts.append(f"{saved} override in article_overrides")
+                if deleted:
+                    parts.append(f"{deleted} articoli cestinati")
+                st.session_state["override_save_msg"] = (
+                    "Salvataggio completato: " + ", ".join(parts) + "."
+                    if parts
+                    else "Nessuna modifica da salvare."
+                )
+                st.rerun()
 
     st.divider()
     with st.expander("Unificazione Autori"):
@@ -987,22 +1098,30 @@ def render_author_unification(conn: sqlite3.Connection) -> None:
     )
 
     existing_map = load_author_map(conn)
-    old_authors = extract_unique_authors(conn)
+    authors_with_counts = extract_unique_authors(conn)
 
     rows = [
         {
-            "Vecchio Autore": old,
-            "Nuovo Autore": existing_map.get(old, ""),
+            "Vecchio Autore": author,
+            "Conteggio Articoli": count,
+            "Nuovo Autore": existing_map.get(author, ""),
         }
-        for old in old_authors
+        for author, count in authors_with_counts
     ]
     df = pd.DataFrame(rows)
+
+    apply_fallback = st.checkbox(
+        "🔮 Assegna automaticamente 'Redazione di Galileo' a tutti gli autori lasciati vuoti"
+    )
 
     edited_df = st.data_editor(
         df,
         column_config={
             "Vecchio Autore": st.column_config.TextColumn(
                 "Vecchio Autore", disabled=True
+            ),
+            "Conteggio Articoli": st.column_config.NumberColumn(
+                "Conteggio Articoli", disabled=True, format="%d"
             ),
             "Nuovo Autore": st.column_config.TextColumn("Nuovo Autore"),
         },
@@ -1012,7 +1131,7 @@ def render_author_unification(conn: sqlite3.Connection) -> None:
     )
 
     if st.button("Salva Unificazione Autori", type="primary"):
-        saved = save_author_map(conn, edited_df)
+        saved = save_author_map(conn, edited_df, apply_fallback=apply_fallback)
         st.success(f"Unificazione salvata: {saved} associazioni scritte in author_map.")
 
 
@@ -1027,6 +1146,23 @@ def main() -> None:
 
     conn = get_connection()
     init_mapping_tables(conn)
+
+    render_prominent_mapping_metrics(conn)
+    render_last_mapped_feed(conn)
+    st.divider()
+
+    with st.sidebar:
+        live_update = st.toggle("🔴 Abilita Aggiornamento Live", value=False)
+        st.divider()
+
+        total, mapped, to_map = get_mapping_stats(conn)
+        col1, col2 = st.columns(2)
+        col1.metric("Mappati", mapped)
+        col2.metric("Da mappare", to_map)
+        st.metric("Totale articoli", total)
+
+        st.subheader("Statistiche di Mappatura")
+        render_mapping_statistics(conn)
 
     render_system_actions(conn)
     st.divider()
@@ -1043,6 +1179,10 @@ def main() -> None:
         render_god_mode(conn)
 
     conn.close()
+
+    if live_update:
+        time.sleep(3)
+        st.rerun()
 
 
 if __name__ == "__main__":
