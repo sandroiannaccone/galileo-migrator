@@ -684,6 +684,8 @@ def save_author_map(
 ) -> int:
     saved = 0
     for _, row in df.iterrows():
+        if "Vecchio Autore" not in row.index:
+            continue
         new_author = row.get("Nuovo Autore", "")
         if pd.isna(new_author) or not str(new_author).strip():
             if apply_fallback:
@@ -700,6 +702,75 @@ def save_author_map(
         saved += 1
     conn.commit()
     return saved
+
+
+def normalize_author_editor_df(data, fallback: pd.DataFrame) -> pd.DataFrame:
+    """Converte lo stato del data_editor in DataFrame (formato Streamlit-safe)."""
+    if data is None:
+        return fallback.copy()
+    if isinstance(data, pd.DataFrame):
+        return data.copy()
+    if isinstance(data, list):
+        return pd.DataFrame(data)
+    if isinstance(data, dict):
+        if data and all(isinstance(v, dict) for v in data.values()):
+            return pd.DataFrame({col: pd.Series(vals) for col, vals in data.items()})
+        if "data" in data:
+            return normalize_author_editor_df(data["data"], fallback)
+    return fallback.copy()
+
+
+def apply_author_bulk_update(
+    source_df: pd.DataFrame,
+    *,
+    copy_old_to_new: bool = False,
+    canonical_name: str | None = None,
+    select_all: bool = False,
+    select_empty: bool = False,
+    clear_selection: bool = False,
+) -> tuple[pd.DataFrame, str | None]:
+    """Applica azioni in blocco sulla tabella autori e restituisce messaggio di feedback."""
+    current = normalize_author_editor_df(source_df, source_df)
+    msg: str | None = None
+
+    if select_all:
+        current["Seleziona"] = True
+    elif select_empty:
+        empty = current["Nuovo Autore"].isna() | (
+            current["Nuovo Autore"].astype(str).str.strip() == ""
+        )
+        current["Seleziona"] = empty
+        msg = f"{int(empty.sum())} righe senza mappatura selezionate."
+    elif clear_selection:
+        current["Seleziona"] = False
+    elif copy_old_to_new:
+        mask = current["Seleziona"].fillna(False).astype(bool)
+        n = int(mask.sum())
+        if n:
+            for idx in current.index[mask]:
+                current.at[idx, "Nuovo Autore"] = str(current.at[idx, "Vecchio Autore"])
+            current["Seleziona"] = False
+            msg = f"{n} autori aggiornati: vecchio nome copiato in Nuovo Autore."
+        else:
+            msg = "Nessuna riga selezionata."
+    elif canonical_name is not None:
+        name = canonical_name.strip()
+        if not name:
+            msg = "Inserisci un nome canonico prima di unificare."
+        else:
+            mask = current["Seleziona"].fillna(False).astype(bool)
+            n = int(mask.sum())
+            if n:
+                for idx in current.index[mask]:
+                    current.at[idx, "Nuovo Autore"] = name
+                current["Seleziona"] = False
+                msg = (
+                    f"{n} varianti unificate sul nome canonico «{name}»."
+                )
+            else:
+                msg = "Nessuna riga selezionata."
+
+    return current.reset_index(drop=True), msg
 
 
 def save_article_overrides(conn: sqlite3.Connection, df: pd.DataFrame) -> tuple[int, int]:
@@ -1094,7 +1165,16 @@ def render_god_mode(conn: sqlite3.Connection) -> None:
 
 def render_author_unification(conn: sqlite3.Connection) -> None:
     st.caption(
-        "Unifica varianti dello stesso autore indicando il nome corretto."
+        "Unifica varianti dello stesso autore indicando il nome corretto. "
+        "Più «vecchi» autori possono puntare allo stesso «nuovo» nome: è il modo "
+        "per unificare persone scritte in modo diverso."
+    )
+
+    st.info(
+        "**Come funziona l'unificazione:** `author_map` salva una riga per ogni variante "
+        "del nome (`vecchio → nuovo`). Se assegni «Mario Rossi» sia a `M. Rossi` sia a "
+        "`mario rossi`, al salvataggio avrai due righe distinte che puntano allo stesso "
+        "nome canonico. In export, ogni articolo risolverà il proprio autore tramite lookup."
     )
 
     existing_map = load_author_map(conn)
@@ -1102,6 +1182,7 @@ def render_author_unification(conn: sqlite3.Connection) -> None:
 
     rows = [
         {
+            "Seleziona": False,
             "Vecchio Autore": author,
             "Conteggio Articoli": count,
             "Nuovo Autore": existing_map.get(author, ""),
@@ -1114,25 +1195,91 @@ def render_author_unification(conn: sqlite3.Connection) -> None:
         "🔮 Assegna automaticamente 'Redazione di Galileo' a tutti gli autori lasciati vuoti"
     )
 
+    if msg := st.session_state.pop("author_copy_msg", None):
+        st.success(msg)
+
     edited_df = st.data_editor(
         df,
         column_config={
+            "Seleziona": st.column_config.CheckboxColumn(
+                "Seleziona",
+                help="Spunta per includere la riga nelle azioni in blocco",
+                default=False,
+            ),
             "Vecchio Autore": st.column_config.TextColumn(
                 "Vecchio Autore", disabled=True
             ),
             "Conteggio Articoli": st.column_config.NumberColumn(
                 "Conteggio Articoli", disabled=True, format="%d"
             ),
-            "Nuovo Autore": st.column_config.TextColumn("Nuovo Autore"),
+            "Nuovo Autore": st.column_config.TextColumn(
+                "Nuovo Autore",
+                help="Nome canonico: può essere uguale al vecchio o condiviso tra più varianti",
+            ),
         },
         hide_index=True,
         width="stretch",
         key="author_editor",
     )
 
+    st.markdown("**Azioni in blocco** (sulle righe selezionate)")
+    unify_col, unify_btn = st.columns([3, 1])
+    with unify_col:
+        canonical_name = st.text_input(
+            "Nome canonico per unificare",
+            placeholder="Es. Mario Rossi",
+            help="Assegna lo stesso nome a tutte le varianti selezionate",
+            key="author_canonical_name",
+        )
+    with unify_btn:
+        unify_clicked = st.button(
+            "Unifica selezionati",
+            type="secondary",
+            help="Imposta Nuovo Autore al nome canonico per le righe selezionate",
+        )
+
+    btn_copy, btn_sel_all, btn_sel_empty, btn_clear = st.columns(4)
+    with btn_copy:
+        copy_clicked = st.button(
+            "Copia Vecchio → Nuovo (selezionati)",
+            type="secondary",
+            help="Copia il vecchio nome nel campo Nuovo Autore per le righe selezionate",
+        )
+    with btn_sel_all:
+        select_all_clicked = st.button("Seleziona tutti")
+    with btn_sel_empty:
+        select_empty_clicked = st.button("Seleziona senza mappatura")
+    with btn_clear:
+        clear_sel_clicked = st.button("Deseleziona tutti")
+
+    if any(
+        (
+            copy_clicked,
+            unify_clicked,
+            select_all_clicked,
+            select_empty_clicked,
+            clear_sel_clicked,
+        )
+    ):
+        updated, msg = apply_author_bulk_update(
+            edited_df,
+            copy_old_to_new=copy_clicked,
+            canonical_name=canonical_name if unify_clicked else None,
+            select_all=select_all_clicked,
+            select_empty=select_empty_clicked,
+            clear_selection=clear_sel_clicked,
+        )
+        st.session_state["author_editor"] = updated
+        if msg:
+            st.session_state["author_copy_msg"] = msg
+        st.rerun()
+
     if st.button("Salva Unificazione Autori", type="primary"):
-        saved = save_author_map(conn, edited_df, apply_fallback=apply_fallback)
+        clean_df = normalize_author_editor_df(edited_df, df)
+        saved = save_author_map(conn, clean_df, apply_fallback=apply_fallback)
+        st.session_state.pop("author_editor", None)
         st.success(f"Unificazione salvata: {saved} associazioni scritte in author_map.")
+        st.rerun()
 
 
 def main() -> None:
